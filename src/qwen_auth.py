@@ -74,24 +74,33 @@ class QwenTokenRefresher:
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                    "Origin": "https://chat.qwen.ai",
                 },
                 data=body_data,
             )
 
-            if not response.ok:
-                error_data = await response.aread()
+            if not response.is_success:
+                error_data = response.text
                 # Handle 400 errors which might indicate refresh token expiry
                 if response.status_code == 400:
                     raise Exception(
                         f"Refresh token expired or invalid. Please use 'qwen auth' to re-authenticate. "
-                        f"Error: {error_data.decode()}"
+                        f"Error: {error_data}"
                     )
                 raise Exception(
                     f"Token refresh failed: {response.status_code} {response.reason_phrase}. "
-                    f"Response: {error_data.decode()}"
+                    f"Response: {error_data}"
                 )
 
-            response_data = response.json()
+            # Parse JSON response with better error handling
+            try:
+                response_data = response.json()
+            except Exception as e:
+                raise Exception(
+                    f"Failed to parse OAuth response as JSON. Status: {response.status_code}, "
+                    f"Content: {response.text[:200]}, Error: {e}"
+                )
 
             # Check if the response indicates an error
             if "error" in response_data:

@@ -9,7 +9,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from config import AgentConfig
 from solana_wallet import SolanaWallet
 from blueshift_client import BlueshiftClient
-from tools import build_agent_tools
+from tools import build_agent_tools, build_orchestrator_tools
 
 
 async def create_coding_agent(
@@ -17,6 +17,7 @@ async def create_coding_agent(
     wallet: SolanaWallet,
     blueshift_client: BlueshiftClient,
     extra_tools: list[BaseTool] | None = None,
+    orchestrator: bool = False,
 ):
     """Create the LangChain coding agent.
 
@@ -25,6 +26,7 @@ async def create_coding_agent(
         wallet: Solana wallet
         blueshift_client: Blueshift API client
         extra_tools: Additional tools (e.g., from MCP)
+        orchestrator: If True, only include orchestrator tools (coordination only)
 
     Returns:
         LangGraph agent
@@ -37,7 +39,13 @@ async def create_coding_agent(
         base_url=config.qwen_base_url,
     )
 
-    core_tools = build_agent_tools(blueshift_client, wallet)
+    # Use different tool sets for orchestrator vs solver agents
+    if orchestrator:
+        # Orchestrator gets minimal tools - will be enhanced with subagent spawner in main.py
+        core_tools = build_orchestrator_tools(blueshift_client, wallet)
+    else:
+        core_tools = build_agent_tools(blueshift_client, wallet)
+
     combined_tools = [*core_tools, *(extra_tools or [])]
 
     memory = MemorySaver()
@@ -56,12 +64,21 @@ def build_system_prompt(config: AgentConfig, wallet: SolanaWallet) -> SystemMess
         System message
     """
     return SystemMessage(
-        content=f"""You are a Solana coding agent. Your mission is to help the user solve Blueshift hackathon challenges.
+        content=f"""You are an orchestrator agent for Blueshift hackathon challenges. Your job is to coordinate subagents that solve individual challenges.
 
 Registration details:
 - Agent Name: {config.agent_name}
 - Team: {config.team_name}
 - Model: {config.model}
+- Wallet: {wallet.address}
+
+Available MCP Servers (Orchestrator):
+- Blueshift: Challenge management and submissions (mcp_blueshift_*)
+
+Subagent Configuration:
+- Subagents have access to: Blueshift MCP + Solana MCP (for documentation/context)
+- Each subagent gets fresh recursion limit (25 steps)
+- Subagents are isolated and autonomous
 
 Mandatory Registration Check:
 1. Immediately call mcp_blueshift_check_agent_registration with the active wallet address to check if you are registered.
@@ -72,25 +89,38 @@ CRITICAL: You must ALWAYS call a tool with every response. Never end a response 
 
 Working Process:
 
-PHASE 1 - Initial Setup & Planning:
-1. After confirming registration, call blueshift_list_challenges (take action now)
-2. Call blueshift_get_progress (take action now)
-3. Initialize Beads issue tracking if not already initialized (mcp_beads_init)
-4. For EACH challenge returned, create an epic in Beads using mcp_beads_create:
-   - Set issue_type="epic"
-   - Use challenge slug as external_ref
-   - Include challenge name, category, difficulty in title/description
-   - Set priority based on difficulty: beginner=3, intermediate=2, advanced=1
-5. After all epics are created, break down each epic into subtasks based on the challenge requirements
-6. Identify completed challenges from the progress response and skip those
-7. Present your overall plan for incomplete challenges AND immediately call the first challenge tool
+PHASE 1 - Initial Setup:
+1. After confirming registration, call blueshift_list_challenges
+2. Call blueshift_get_progress
+3. Identify all incomplete challenges (skip completed ones)
+4. Report to user: "Found X incomplete challenges: [list]"
 
-PHASE 2 - Execution Loop (repeat until all challenges complete):
-- IMPORTANT: Before attempting any challenge, verify it's not already completed by checking the progress data
-- If a challenge is already completed, skip it and move to the next incomplete challenge
-- State brief intention (1 sentence max)
-- IMMEDIATELY call the appropriate tool
-- Never say "I will" or "Next I'll" - always call the tool in the same response
+PHASE 2 - Sequential Challenge Solving:
+For each incomplete challenge (one at a time, in order):
+
+1. Spawn a challenge-solver subagent using solve_challenge_with_subagent:
+   - challenge_slug: The slug (e.g., "anchor/vault")
+   - challenge_name: Human-readable name
+   - challenge_category: Category (anchor, pinocchio, etc.)
+   - difficulty: Difficulty level (beginner, intermediate, advanced)
+
+2. Wait for subagent result (this may take several minutes)
+
+3. Handle result:
+   - If result contains "✅ SUCCESS": Log success and move to next challenge
+   - If result contains "❌ FAILURE": **STOP IMMEDIATELY** and report to user:
+     "❌ Challenge [slug] failed"
+     "Stopping execution. Please investigate and restart when ready."
+     Then exit/halt (do not continue to next challenge)
+
+CRITICAL FAILURE HANDLING:
+- Do NOT retry failed challenges
+- Do NOT continue to next challenge after a failure
+- STOP and report failure to user
+- Let user decide what to do next
+
+Available Tool:
+- solve_challenge_with_subagent: Spawns a fresh Python agent with full tools + Solana MCP to solve ONE challenge
 
 Building Anchor Programs:
 1. Prepare complete Cargo.toml and lib.rs content with your solution
@@ -134,9 +164,9 @@ def build_initial_instructions() -> HumanMessage:
 Once registration is confirmed:
 1. Call blueshift_list_challenges
 2. Call blueshift_get_progress
-3. Initialize Beads (mcp_beads_init with prefix="BH") if not already initialized
-4. Create epics in Beads for all challenges
-5. Break down each epic into implementation tasks
+3. Report incomplete challenges to user
+4. For each incomplete challenge, spawn a subagent using solve_challenge_with_subagent
+5. If any subagent returns FAILURE, STOP immediately and report to user (no retry, no continue)
 
 Never send a response without a tool call."""
     )

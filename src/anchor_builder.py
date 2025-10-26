@@ -30,6 +30,7 @@ class CreatedAnchorProgram:
     workspace_dir: str
     files: list[dict[str, str]]
     build: Optional[AnchorBuildResult] = None
+    source_files: Optional[dict[str, str]] = None  # Absolute paths to source files
 
 
 def sanitize_program_name(name: str) -> str:
@@ -118,6 +119,21 @@ async def create_anchor_program(
         {"path": str(program_cargo_path.relative_to(workspace_dir)), "content": cargo_toml}
     )
 
+    # Save source files to source/ directory for failure analysis
+    source_backup_dir = workspace_dir / "source"
+    source_backup_dir.mkdir(exist_ok=True)
+
+    source_lib_rs = source_backup_dir / "lib.rs"
+    source_lib_rs.write_text(lib_rs, encoding="utf-8")
+
+    source_cargo_toml = source_backup_dir / "Cargo.toml"
+    source_cargo_toml.write_text(cargo_toml, encoding="utf-8")
+
+    source_file_paths = {
+        "lib.rs": str(source_lib_rs),
+        "Cargo.toml": str(source_cargo_toml),
+    }
+
     # Build the program
     build_result: Optional[AnchorBuildResult] = None
 
@@ -141,6 +157,12 @@ async def create_anchor_program(
         if has_so:
             so_bytes = program_so_path.read_bytes()
             program_so_base64 = base64.b64encode(so_bytes).decode("ascii")
+
+        # Save build logs
+        build_log_path = source_backup_dir / "build.log"
+        build_log_content = f"=== STDOUT ===\n{stdout.decode()}\n\n=== STDERR ===\n{stderr.decode()}"
+        build_log_path.write_text(build_log_content, encoding="utf-8")
+        source_file_paths["build.log"] = str(build_log_path)
 
         if process.returncode == 0:
             build_result = AnchorBuildResult(
@@ -182,6 +204,7 @@ async def create_anchor_program(
         workspace_dir=str(workspace_dir),
         files=files,
         build=build_result,
+        source_files=source_file_paths,
     )
 
 

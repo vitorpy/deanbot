@@ -93,6 +93,12 @@ class RunAnchorBuildSchema(BaseModel):
     workspace_dir: str = Field(..., description="Absolute path to workspace directory")
 
 
+class AnalyzeFailureSchema(BaseModel):
+    """Schema for analyzing submission failure."""
+
+    failure_dir: str = Field(..., description="Absolute path to failure directory (from failure_dir in submission response)")
+
+
 # Tools
 
 
@@ -228,9 +234,19 @@ class GetProgressTool(BaseTool):
     async def _arun(self) -> str:
         """Get progress."""
         progress = await self.client.get_progress()
+
+        # Convert challenges with nested objects
+        challenges_list = []
+        for c in progress.challenges:
+            challenge_dict = c.__dict__.copy()
+            # Convert nested LatestAttempt object if present
+            if challenge_dict.get("latest_attempt"):
+                challenge_dict["latest_attempt"] = challenge_dict["latest_attempt"].__dict__
+            challenges_list.append(challenge_dict)
+
         result = {
             "agent": progress.agent.__dict__ if progress.agent else None,
-            "challenges": [c.__dict__ for c in progress.challenges],
+            "challenges": challenges_list,
         }
         return json.dumps(result, indent=2)
 
@@ -257,12 +273,84 @@ class AttemptProgramTool(BaseTool):
             response = await self.client.submit_program_challenge(slug, program_buffer)
             text = await response.aread()
 
-            return json.dumps(
-                {"status": response.status_code, "ok": response.is_success, "body": text.decode()},
-                indent=2,
-            )
+            result = {
+                "status": response.status_code,
+                "ok": response.is_success,
+                "body": text.decode()
+            }
+
+            # Auto-save failures
+            if not response.is_success:
+                failure_dir = await self._save_failure(slug, program_path, response, text)
+                result["failure_dir"] = str(failure_dir)
+
+            return json.dumps(result, indent=2)
         except Exception as e:
             return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+    async def _save_failure(self, slug: str, program_path: str, response, response_text: bytes) -> Path:
+        """Save submission failure artifacts.
+
+        Args:
+            slug: Challenge slug
+            program_path: Path to .so file
+            response: HTTP response
+            response_text: Response body bytes
+
+        Returns:
+            Path to failure directory
+        """
+        from datetime import datetime
+
+        # Create failure directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_slug = slug.replace("/", "-")
+        failure_root = Path.cwd() / "artifacts" / "failures"
+        failure_root.mkdir(parents=True, exist_ok=True)
+
+        failure_dir = failure_root / f"{safe_slug}_{timestamp}"
+        failure_dir.mkdir(exist_ok=True)
+
+        # Save program.so
+        program_so_dest = failure_dir / "program.so"
+        import shutil
+        shutil.copy2(program_path, program_so_dest)
+
+        # Save API response
+        api_response = {
+            "status": response.status_code,
+            "headers": dict(response.headers),
+            "body": response_text.decode(errors="replace"),
+        }
+        (failure_dir / "api_response.json").write_text(
+            json.dumps(api_response, indent=2), encoding="utf-8"
+        )
+
+        # Try to find and copy source files
+        # .so path is usually: {workspace}/target/deploy/{name}.so
+        program_path_obj = Path(program_path)
+        if program_path_obj.parts[-3:-1] == ("target", "deploy"):
+            # Infer workspace directory
+            workspace_dir = program_path_obj.parents[2]
+            source_dir = workspace_dir / "source"
+
+            if source_dir.exists():
+                # Copy source files
+                dest_source_dir = failure_dir / "source"
+                shutil.copytree(source_dir, dest_source_dir)
+
+        # Save metadata
+        metadata = {
+            "slug": slug,
+            "timestamp": timestamp,
+            "program_path": str(program_path),
+            "workspace_inferred": str(workspace_dir) if 'workspace_dir' in locals() else None,
+        }
+        (failure_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+
+        return failure_dir
 
 
 class AttemptClientTool(BaseTool):
@@ -322,6 +410,7 @@ class CreateAnchorProgramTool(BaseTool):
                 "workspaceDir": result.workspace_dir,
                 "files": result.files,
                 "build": build_dict,
+                "sourceFiles": result.source_files,
             },
             indent=2,
         )
@@ -388,17 +477,219 @@ class RunAnchorBuildTool(BaseTool):
         return json.dumps(result, indent=2)
 
 
-def build_agent_tools(client: BlueshiftClient, wallet: SolanaWallet) -> list[BaseTool]:
-    """Build all agent tools.
+class AnalyzeSubmissionFailureTool(BaseTool):
+    """Tool to analyze submission failures."""
+
+    name: str = "analyze_submission_failure"
+    description: str = (
+        "Analyzes a failed submission by examining the error, source code, and build logs. "
+        "Searches knowledge base for similar issues and suggests fixes. "
+        "Use this after a submission fails to understand why and how to fix it."
+    )
+    args_schema: type[BaseModel] = AnalyzeFailureSchema
+
+    rag_tool: BaseTool  # Knowledge base search tool
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _run(self, failure_dir: str) -> str:
+        """Analyze failure - sync wrapper."""
+        import asyncio
+        return asyncio.run(self._arun(failure_dir))
+
+    async def _arun(self, failure_dir: str) -> str:
+        """Analyze failure."""
+        failure_path = Path(failure_dir)
+
+        if not failure_path.exists():
+            return f"Error: Failure directory not found: {failure_dir}"
+
+        # Read API response
+        api_response_file = failure_path / "api_response.json"
+        if not api_response_file.exists():
+            return f"Error: api_response.json not found in {failure_dir}"
+
+        api_response = json.loads(api_response_file.read_text())
+        error_message = api_response.get("body", "No error message")
+        status_code = api_response.get("status", 0)
+
+        # Read source files if available
+        source_dir = failure_path / "source"
+        lib_rs_content = None
+        cargo_toml_content = None
+        build_log_content = None
+
+        if source_dir.exists():
+            lib_rs_file = source_dir / "lib.rs"
+            cargo_toml_file = source_dir / "Cargo.toml"
+            build_log_file = source_dir / "build.log"
+
+            if lib_rs_file.exists():
+                lib_rs_content = lib_rs_file.read_text()
+            if cargo_toml_file.exists():
+                cargo_toml_content = cargo_toml_file.read_text()
+            if build_log_file.exists():
+                build_log_content = build_log_file.read_text()
+
+        # Extract error type for KB search
+        error_keywords = self._extract_error_keywords(error_message)
+
+        # Search knowledge base
+        kb_results = None
+        if self.rag_tool and error_keywords:
+            try:
+                kb_query = f"solana anchor error {error_keywords}"
+                kb_results = await self.rag_tool._arun(kb_query)
+            except Exception as e:
+                kb_results = f"KB search failed: {e}"
+
+        # Build analysis
+        analysis_lines = [
+            f"# Failure Analysis",
+            f"",
+            f"## Error Details",
+            f"- **Status Code**: {status_code}",
+            f"- **Error Message**:",
+            f"```",
+            error_message,
+            f"```",
+            f"",
+        ]
+
+        if build_log_content:
+            # Check for warnings in build log
+            warnings = [line for line in build_log_content.split("\n") if "warning" in line.lower()]
+            if warnings:
+                analysis_lines.extend([
+                    f"## Build Warnings",
+                    "```",
+                    *warnings[:10],  # Limit to 10 warnings
+                    "```",
+                    "",
+                ])
+
+        if kb_results:
+            analysis_lines.extend([
+                f"## Knowledge Base Search",
+                f"Query: `{error_keywords}`",
+                f"",
+                kb_results,
+                f"",
+            ])
+
+        if lib_rs_content:
+            # Basic code analysis
+            analysis_lines.extend([
+                f"## Code Analysis",
+                f"- Source file exists: lib.rs ({len(lib_rs_content)} bytes)",
+                "",
+            ])
+
+        analysis_lines.extend([
+            f"## Suggested Actions",
+            f"1. Review the error message above",
+            f"2. Check similar examples in knowledge base results",
+            f"3. Verify program ID is: `declare_id!(\"22222222222222222222222222222222222222222222\");`",
+            f"4. Verify anchor-lang version is 0.32.1 in Cargo.toml",
+            f"5. Review build warnings if any",
+            f"",
+            f"## Artifacts Saved",
+            f"- Location: `{failure_dir}`",
+            f"- program.so: Available",
+            f"- Source files: {'Available' if source_dir.exists() else 'Not available'}",
+        ])
+
+        analysis_text = "\n".join(analysis_lines)
+
+        # Write analysis.md
+        analysis_file = failure_path / "analysis.md"
+        analysis_file.write_text(analysis_text, encoding="utf-8")
+
+        return analysis_text
+
+    def _extract_error_keywords(self, error_message: str) -> str:
+        """Extract keywords from error message for KB search."""
+        # Simple keyword extraction - look for common error patterns
+        keywords = []
+
+        error_lower = error_message.lower()
+
+        if "compute" in error_lower:
+            keywords.append("compute budget")
+        if "account" in error_lower:
+            keywords.append("account")
+        if "instruction" in error_lower:
+            keywords.append("instruction")
+        if "deserialize" in error_lower or "serialize" in error_lower:
+            keywords.append("serialization")
+        if "constraint" in error_lower:
+            keywords.append("constraint")
+        if "seed" in error_lower or "pda" in error_lower:
+            keywords.append("PDA seeds")
+
+        return " ".join(keywords) if keywords else "error"
+
+
+def build_orchestrator_tools(
+    client: BlueshiftClient,
+    wallet: SolanaWallet,
+    config: "AgentConfig" = None,
+    solana_mcp_tools: list = None,
+    rag_tool: BaseTool = None,
+    output_callback: callable = None,
+) -> list[BaseTool]:
+    """Build orchestrator agent tools (coordination only, no challenge-solving tools).
+
+    The orchestrator spawns Python subagents for actual challenge solving.
 
     Args:
         client: Blueshift API client
         wallet: Solana wallet
+        config: Agent configuration (for spawning subagents)
+        solana_mcp_tools: Solana MCP tools to pass to subagents
+        rag_tool: RAG knowledge base search tool to pass to subagents
+        output_callback: Callback for subagent output
 
     Returns:
-        List of LangChain tools
+        List of coordination tools only
     """
-    return [
+    from subagent_runner import SolveChallengeTool
+
+    tools = [
+        GetWalletAddressTool(wallet=wallet),
+        ListChallengesTool(client=client),
+        GetProgressTool(client=client),
+    ]
+
+    # Add subagent spawner if we have the dependencies
+    if config and solana_mcp_tools is not None:
+        tools.append(
+            SolveChallengeTool(
+                config=config,
+                wallet=wallet,
+                blueshift_client=client,
+                solana_mcp_tools=solana_mcp_tools,
+                rag_tool=rag_tool,
+                output_callback=output_callback,
+            )
+        )
+
+    return tools
+
+
+def build_agent_tools(client: BlueshiftClient, wallet: SolanaWallet, rag_tool: BaseTool = None) -> list[BaseTool]:
+    """Build all agent tools (for challenge-solver subagents).
+
+    Args:
+        client: Blueshift API client
+        wallet: Solana wallet
+        rag_tool: Optional RAG knowledge base search tool
+
+    Returns:
+        List of all LangChain tools
+    """
+    tools = [
         GetWalletAddressTool(wallet=wallet),
         SignBytesTool(wallet=wallet),
         EncodeBase58Tool(wallet=wallet),
@@ -412,3 +703,10 @@ def build_agent_tools(client: BlueshiftClient, wallet: SolanaWallet) -> list[Bas
         WriteFileTool(),
         RunAnchorBuildTool(),
     ]
+
+    if rag_tool:
+        tools.append(rag_tool)
+        # Add failure analysis tool (depends on rag_tool)
+        tools.append(AnalyzeSubmissionFailureTool(rag_tool=rag_tool))
+
+    return tools

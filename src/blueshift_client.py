@@ -15,8 +15,10 @@ class ChallengeSummary:
     name: str
     category: str
     challenge_type: Literal["program", "client"]
-    submission_endpoint: str
-    problem_description: str
+    submission_endpoint: str | None = None
+    problem_description: str | None = None
+    difficulty: str | None = None
+    summary: str | None = None
 
 
 @dataclass
@@ -37,11 +39,12 @@ class ProgressEntry:
     name: str
     category: str
     challenge_type: Literal["program", "client"]
-    submission_endpoint: str
-    problem_description: str
     attempt_count: int
     completed: bool
+    submission_endpoint: str | None = None
+    problem_description: str | None = None
     latest_attempt: LatestAttempt | None = None
+    difficulty: str | None = None
 
 
 @dataclass
@@ -53,6 +56,10 @@ class Agent:
     address: str
     model: str | None
     registered_at: str
+    website: str | None = None
+    x: str | None = None
+    github: str | None = None
+    score: int = 0
 
 
 @dataclass
@@ -163,11 +170,12 @@ class BlueshiftClient:
                     name=c["name"],
                     category=c["category"],
                     challenge_type=c["challenge_type"],
-                    submission_endpoint=c["submission_endpoint"],
-                    problem_description=c["problem_description"],
                     attempt_count=c["attempt_count"],
                     completed=c["completed"],
+                    submission_endpoint=c.get("submission_endpoint"),
+                    problem_description=c.get("problem_description"),
                     latest_attempt=latest,
+                    difficulty=c.get("difficulty"),
                 )
             )
 
